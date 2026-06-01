@@ -213,31 +213,6 @@ Results are saved to `outputs/lint-YYYY-MM-DD.md`.
 
 ---
 
-## GitHub Codespaces
-
-This repo includes a `.devcontainer` config. Click **Code → Codespaces → Create codespace** and you'll have a working environment in 60 seconds with the `wiki` CLI ready.
-
-```bash
-# In Codespace — set your provider via the Codespace secrets UI, then:
-wiki init
-wiki ingest
-wiki query "your question"
-```
-
----
-
-## Roadmap
-
-This is an iterative project — contributions committed daily.
-
-**Day 1 (this commit):** Provider adapter layer, core wiki engine, CLI skeleton, tests  
-**Day 2:** Streaming output, better ingest parsing, token usage tracking  
-**Day 3:** Semantic search over wiki pages (optional, no external deps)  
-**Day 4:** Web clipper integration, PDF ingestion  
-**Day 5+:** NLI-based contradiction detection, multi-wiki support, graph visualisation
-
----
-
 ## Contributing
 
 PRs welcome. The codebase is intentionally simple — no frameworks, no heavy deps.
@@ -258,13 +233,11 @@ The `tests/` directory uses a `MockProvider` that requires no API key — all te
 
 The goal of this project is to make that true for everyone — not just people with Claude Pro subscriptions or OpenAI API budgets. A student with a laptop running Ollama should get the same compounding knowledge system as an enterprise with a cloud budget.
 
-Knowledge bases shouldn't be locked behind paywalls.
-
 ---
 
 ## License
 
-MIT — do whatever you want with this.
+MIT
 
 ---
 
