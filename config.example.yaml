@@ -1,0 +1,31 @@
+# llm-wiki-universal — example configuration
+# Copy this to your wiki root as config.yaml and edit as needed.
+# See: https://github.com/AswinKumar1/LLM-Wiki-Prod
+
+# ── Provider ──────────────────────────────────────────────────────────────────
+# Options: ollama | openai | anthropic | openai_compat
+# Override with env var: WIKI_PROVIDER=openai
+provider: ollama
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+# Ollama:        qwen2.5:3b  mistral:7b  llama3.2:3b  phi3.5  hermes3
+# OpenAI:        gpt-4o-mini  gpt-4o  o1-mini
+# Anthropic:     claude-haiku-4-5-20251001  claude-sonnet-4-6
+# openai_compat: whatever model your server serves
+# Override with env var: WIKI_MODEL=gpt-4o-mini
+model: qwen2.5:3b
+
+# ── API key ───────────────────────────────────────────────────────────────────
+# Prefer env vars over this file (don't commit API keys).
+# OPENAI_API_KEY     — for openai provider
+# ANTHROPIC_API_KEY  — for anthropic provider
+# api_key: ""
+
+# ── OpenAI-compatible base URL ────────────────────────────────────────────────
+# Uncomment and set if using a local server (LM Studio, vLLM, etc.)
+# base_url: http://localhost:1234/v1
+
+# ── Generation settings ───────────────────────────────────────────────────────
+temperature: 0.2     # lower = more deterministic wiki pages
+max_tokens: 4096     # max tokens per LLM call
+timeout: 120         # HTTP timeout in seconds
