@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-llm-wiki-universal CLI
+llm-wiki-universal CLI — Day 2 upgrade
 
-Commands:
-  wiki init    [--provider ollama] [--model qwen2.5:3b]
-  wiki ingest  [--source path/to/file]
-  wiki query   "your question here"  [--save]
-  wiki lint
-  wiki status
-  wiki providers
+New commands:
+  wiki doctor   — pre-flight check: config, dirs, provider health
+  wiki usage    — show token usage and estimated cost summary
 
-Run `wiki <command> --help` for options.
+Updated commands:
+  wiki query    — now supports --stream flag for live token output
+  wiki ingest   — now shows chunk progress and cost per source
+  wiki status   — now includes usage summary
 """
 
 from __future__ import annotations
@@ -26,69 +25,84 @@ def main() -> None:
         description="LLM-Wiki-Universal — provider-agnostic knowledge base",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
-        "--root",
-        default=".",
-        help="Wiki root directory (default: current directory)",
-    )
-    parser.add_argument(
-        "--provider",
-        help="Override provider from config (ollama | openai | anthropic | openai_compat)",
-    )
-    parser.add_argument(
-        "--model",
-        help="Override model from config",
-    )
-    parser.add_argument(
-        "--verbose", "-v",
-        action="store_true",
-        help="Verbose output",
-    )
+    parser.add_argument("--root", default=".", help="Wiki root directory")
+    parser.add_argument("--provider", help="Override provider from config")
+    parser.add_argument("--model", help="Override model from config")
+    parser.add_argument("--verbose", "-v", action="store_true")
 
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command", required=True)
 
     # init
-    p_init = subparsers.add_parser("init", help="Initialise a new wiki in the current directory")
-    p_init.add_argument("--topic", default="", help="Wiki topic (used to generate AGENTS.md)")
+    p_init = sub.add_parser("init", help="Initialise a new wiki")
+    p_init.add_argument("--topic", default="")
     p_init.add_argument("--provider", default="ollama")
     p_init.add_argument("--model", default="")
 
     # ingest
-    p_ingest = subparsers.add_parser("ingest", help="Ingest raw sources into the wiki")
-    p_ingest.add_argument("--source", default=None, help="Ingest a specific file (default: all new)")
-    p_ingest.add_argument("--max", type=int, default=None, help="Max number of sources to process")
+    p_ingest = sub.add_parser("ingest", help="Ingest raw sources into the wiki")
+    p_ingest.add_argument("--source", default=None)
+    p_ingest.add_argument("--max", type=int, default=None)
+    p_ingest.add_argument(
+        "--chunk-size",
+        type=int,
+        default=6000,
+        help="Max tokens per chunk for large files (default: 6000)",
+    )
 
     # query
-    p_query = subparsers.add_parser("query", help="Ask a question against the wiki")
-    p_query.add_argument("question", help="The question to answer")
-    p_query.add_argument("--save", action="store_true", help="Save the answer as a wiki page")
+    p_query = sub.add_parser("query", help="Ask a question against the wiki")
+    p_query.add_argument("question")
+    p_query.add_argument("--save", action="store_true")
+    p_query.add_argument(
+        "--stream",
+        action="store_true",
+        help="Stream tokens as they arrive (requires provider stream support)",
+    )
 
     # lint
-    subparsers.add_parser("lint", help="Health-check the wiki")
+    sub.add_parser("lint", help="Health-check the wiki")
 
     # status
-    subparsers.add_parser("status", help="Show wiki stats and provider health")
+    sub.add_parser("status", help="Show wiki stats and provider health")
 
     # providers
-    subparsers.add_parser("providers", help="List supported providers")
+    sub.add_parser("providers", help="List supported providers")
+
+    # doctor  ← NEW
+    p_doctor = sub.add_parser("doctor", help="Pre-flight check: config, dirs, provider")
+    p_doctor.add_argument(
+        "--no-health-check",
+        action="store_true",
+        help="Skip provider reachability check (useful offline)",
+    )
+
+    # usage  ← NEW
+    p_usage = sub.add_parser("usage", help="Show token usage and cost summary")
+    p_usage.add_argument(
+        "--since",
+        default=None,
+        help="Filter to entries on or after this date (YYYY-MM-DD)",
+    )
 
     args = parser.parse_args()
 
-    # Route to command handlers
     dispatch = {
-        "init":      cmd_init,
-        "ingest":    cmd_ingest,
-        "query":     cmd_query,
-        "lint":      cmd_lint,
-        "status":    cmd_status,
+        "init": cmd_init,
+        "ingest": cmd_ingest,
+        "query": cmd_query,
+        "lint": cmd_lint,
+        "status": cmd_status,
         "providers": cmd_providers,
+        "doctor": cmd_doctor,
+        "usage": cmd_usage,
     }
     dispatch[args.command](args)
 
 
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Command handlers
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+
 
 def cmd_init(args) -> None:
     from .config import load_config, config_to_yaml
@@ -96,7 +110,6 @@ def cmd_init(args) -> None:
     from .providers.base import ProviderConfig
 
     root = Path(args.root).resolve()
-
     cfg = ProviderConfig(
         provider=getattr(args, "provider", "ollama") or "ollama",
         model=getattr(args, "model", "") or "",
@@ -108,105 +121,193 @@ def cmd_init(args) -> None:
     fs.ensure_structure()
     fs.init_index()
 
-    # Write config.yaml
     if not fs.config_path.exists():
         fs.config_path.write_text(config_to_yaml(cfg))
-        _print_ok(f"Created config.yaml  (provider: {cfg.provider}, model: {cfg.model})")
+        _ok(f"Created config.yaml  (provider: {cfg.provider}, model: {cfg.model})")
     else:
-        _print_info("config.yaml already exists — skipped")
+        _info("config.yaml already exists — skipped")
 
-    # Write AGENTS.md
     if not fs.agents_md_path.exists():
         topic = getattr(args, "topic", "") or "General"
-        agents_content = _default_agents_md(topic)
-        fs.agents_md_path.write_text(agents_content)
-        _print_ok("Created AGENTS.md")
+        fs.agents_md_path.write_text(_default_agents_md(topic))
+        _ok("Created AGENTS.md")
     else:
-        _print_info("AGENTS.md already exists — skipped")
+        _info("AGENTS.md already exists — skipped")
 
-    # Write .gitignore
     gitignore = root / ".gitignore"
     if not gitignore.exists():
         gitignore.write_text("outputs/*.pdf\n__pycache__/\n*.pyc\n.env\n")
-        _print_ok("Created .gitignore")
+        _ok("Created .gitignore")
 
-    _print_ok(f"\nWiki initialised at: {root}")
-    print()
-    print("Next steps:")
-    print(f"  1. Drop files into {root}/raw/articles/")
-    print(f"  2. Run: wiki ingest")
-    print(f"  3. Run: wiki query \"your question here\"")
+    _ok(f"\nWiki initialised at: {root}")
+    print(f"\n  Next: drop files into {root}/raw/articles/  then  wiki ingest")
 
 
 def cmd_ingest(args) -> None:
     provider = _get_provider(args)
     from .wiki_fs import WikiFS
-    from .operations import IngestOperation
+    from .operations.ingest import IngestOperation
 
     fs = WikiFS(Path(args.root).resolve())
-    op = IngestOperation(provider, fs, verbose=args.verbose)
+    op = IngestOperation(
+        provider,
+        fs,
+        verbose=args.verbose,
+        max_tokens_per_chunk=getattr(args, "chunk_size", 6000),
+    )
 
     if args.source:
         source_path = Path(args.source)
         if not source_path.exists():
-            _print_err(f"Source file not found: {args.source}")
+            _err(f"Source file not found: {args.source}")
             sys.exit(1)
         results = [op.run_one(source_path)]
     else:
         results = op.run(max_sources=getattr(args, "max", None))
 
     if not results:
-        _print_info("No new sources to ingest. Drop files into raw/ first.")
+        _info("No new sources to ingest. Drop files into raw/ first.")
         return
 
+    total_tokens = 0
+    total_cost = 0.0
     for r in results:
         if r.success:
-            _print_ok(
-                f"{r.source_name}: "
+            chunk_note = f" ({r.chunks_processed} chunks)" if r.chunks_processed > 1 else ""
+            cost_note = f"  ${r.cost_usd:.4f}" if r.cost_usd > 0 else ""
+            _ok(
+                f"{r.source_name}{chunk_note}: "
                 f"{len(r.pages_created)} created, "
-                f"{len(r.pages_updated)} updated "
-                f"({r.tokens_used} tokens)"
+                f"{len(r.pages_updated)} updated  "
+                f"[{r.tokens_used} tokens{cost_note}]"
             )
             if args.verbose and r.takeaways:
                 print(f"\n  Takeaways:\n{r.takeaways}\n")
+            total_tokens += r.tokens_used
+            total_cost += r.cost_usd
         else:
-            _print_err(f"{r.source_name}: FAILED — {r.error}")
+            _err(f"{r.source_name}: FAILED — {r.error}")
+
+    if len(results) > 1:
+        cost_str = f"  total cost: ${total_cost:.4f}" if total_cost > 0 else ""
+        print(f"\n  Total: {total_tokens:,} tokens{cost_str}")
 
 
 def cmd_query(args) -> None:
     provider = _get_provider(args)
     from .wiki_fs import WikiFS
-    from .operations import QueryOperation
+    from .operations.query import QueryOperation
+    from .utils.usage import UsageTracker
 
     fs = WikiFS(Path(args.root).resolve())
+    tracker = UsageTracker(fs.root)
     op = QueryOperation(provider, fs, verbose=args.verbose)
-    result = op.run(args.question, save_answer=args.save)
 
+    # Streaming path
+    if getattr(args, "stream", False):
+        _run_streaming_query(provider, fs, op, args, tracker)
+        return
+
+    result = op.run(args.question, save_answer=args.save)
     if result.success:
         print()
         print(result.answer)
         print()
-        if args.verbose:
-            print(f"  Pages read: {result.pages_read}")
-            print(f"  Tokens used: {result.tokens_used}")
+        if result.tokens_used:
+            cost = tracker.record(
+                op="query",
+                provider=provider.provider_name,
+                model=provider.model_name,
+                prompt_tokens=result.tokens_used // 2,
+                completion_tokens=result.tokens_used // 2,
+            )
+            if args.verbose:
+                cost_str = f"  ${cost:.4f}" if cost > 0 else ""
+                print(f"  Pages read:   {result.pages_read}")
+                print(f"  Tokens used:  {result.tokens_used:,}{cost_str}")
         if result.saved_to:
-            _print_ok(f"Answer saved to: {result.saved_to}")
+            _ok(f"Answer saved to: {result.saved_to}")
     else:
-        _print_err(f"Query failed: {result.error}")
+        _err(f"Query failed: {result.error}")
         sys.exit(1)
+
+
+def _run_streaming_query(provider, fs, op, args, tracker) -> None:
+    """Stream tokens to stdout as they arrive."""
+    from .prompts import query_find_relevant_pages, query_question
+
+    index_content = fs.read_index()
+    if not index_content.strip():
+        _err("Wiki index is empty. Run `wiki ingest` first.")
+        sys.exit(1)
+
+    # Step 1: find relevant pages (non-streaming, fast)
+    sys_fp, usr_fp = query_find_relevant_pages(args.question, index_content)
+    try:
+        page_resp = provider.chat(sys_fp, usr_fp, max_tokens=512)
+    except Exception as exc:
+        _err(f"Failed to find relevant pages: {exc}")
+        sys.exit(1)
+
+    import json, re
+
+    paths: list[str] = []
+    try:
+        match = re.search(r"\[.*?\]", page_resp.content, re.DOTALL)
+        if match:
+            paths = json.loads(match.group())
+    except Exception:
+        paths = [str(fs.relative_to_root(p)) for p in fs.list_wiki_pages()[:8]]
+
+    pages: dict[str, str] = {}
+    for path in paths:
+        content = fs.read_wiki_page(path)
+        if content:
+            pages[path] = content
+
+    if not pages:
+        pages = {"wiki/index.md": index_content}
+
+    if args.verbose:
+        print(f"  Reading: {list(pages.keys())}\n")
+
+    # Step 2: stream the answer
+    system, user = query_question(args.question, pages)
+    print()
+    total_chars = 0
+    try:
+        for token in provider.stream(system, user):
+            print(token, end="", flush=True)
+            total_chars += len(token)
+    except Exception as exc:
+        print()
+        _err(f"Streaming error: {exc}")
+        sys.exit(1)
+
+    print("\n")
+
+    # Rough token estimate from chars streamed
+    approx_tokens = total_chars // 4
+    tracker.record(
+        op="query",
+        provider=provider.provider_name,
+        model=provider.model_name,
+        prompt_tokens=approx_tokens,
+        completion_tokens=approx_tokens,
+    )
 
 
 def cmd_lint(args) -> None:
     provider = _get_provider(args)
     from .wiki_fs import WikiFS
-    from .operations import LintOperation
+    from .operations.lint import LintOperation
 
     fs = WikiFS(Path(args.root).resolve())
     op = LintOperation(provider, fs, verbose=args.verbose)
     result = op.run()
 
     if result.success:
-        _print_ok(f"Lint complete — {result.issue_count} issues found")
+        _ok(f"Lint complete — {result.issue_count} issues found")
         if result.contradictions:
             print(f"\n  Contradictions ({len(result.contradictions)}):")
             for c in result.contradictions:
@@ -222,9 +323,9 @@ def cmd_lint(args) -> None:
         if result.summary:
             print(f"\n  Summary: {result.summary}")
         if result.output_path:
-            _print_info(f"Full report: {result.output_path}")
+            _info(f"Full report: {result.output_path}")
     else:
-        _print_err(f"Lint failed: {result.error}")
+        _err(f"Lint failed: {result.error}")
         sys.exit(1)
 
 
@@ -232,6 +333,7 @@ def cmd_status(args) -> None:
     from .config import load_config
     from .wiki_fs import WikiFS
     from .providers.factory import get_provider
+    from .utils.usage import UsageTracker
 
     root = Path(args.root).resolve()
     cfg = load_config(root)
@@ -241,52 +343,117 @@ def cmd_status(args) -> None:
         cfg.model = args.model
 
     fs = WikiFS(root)
+    tracker = UsageTracker(root)
 
-    print(f"\n{'─'*40}")
+    print(f"\n{'─' * 44}")
     print(f"  Wiki root:   {root}")
-    print(f"  Provider:    {cfg.provider}")
-    print(f"  Model:       {cfg.model}")
-    print(f"{'─'*40}")
+    print(f"  Provider:    {cfg.provider}  ({cfg.model})")
+    print(f"{'─' * 44}")
 
     pages = fs.list_wiki_pages()
     sources = fs.list_raw_sources()
     new_sources = fs.new_raw_sources()
     print(f"  Wiki pages:  {len(pages)}")
-    print(f"  Raw sources: {len(sources)} ({len(new_sources)} unprocessed)")
-    print(f"  Last 3 ops:  {fs.read_log(3) or '(none)'}")
-    print(f"{'─'*40}")
+    print(f"  Raw sources: {len(sources)}  ({len(new_sources)} unprocessed)")
 
-    # Provider health
+    log = fs.read_log(3)
+    if log:
+        print(f"  Recent ops:")
+        for line in log.splitlines():
+            print(f"    {line}")
+
+    summary = tracker.summary()
+    if summary["total_calls"] > 0:
+        print(f"{'─' * 44}")
+        print(
+            f"  Token usage: {summary['total_prompt_tokens'] + summary['total_completion_tokens']:,} total"
+        )
+        print(f"  Est. cost:   ${summary['total_cost_usd']:.4f} USD")
+
+    print(f"{'─' * 44}")
     try:
         provider = get_provider(cfg)
         ok = provider.health_check()
-        status = "✓ reachable" if ok else "✗ not reachable"
-        print(f"  Provider health: {status}")
+        print(f"  Provider:    {'✓ reachable' if ok else '✗ not reachable'}")
     except Exception as exc:
-        print(f"  Provider health: ✗ error — {exc}")
+        print(f"  Provider:    ✗ {exc}")
     print()
 
 
 def cmd_providers(args) -> None:
     from .providers.factory import list_providers
+
     print("\nSupported providers:")
     descriptions = {
-        "ollama":        "Local models via Ollama (free, no API key) — default",
-        "openai":        "OpenAI GPT-4o, GPT-4o-mini, o1 — requires OPENAI_API_KEY",
-        "anthropic":     "Anthropic Claude — requires ANTHROPIC_API_KEY",
-        "openai_compat": "Any OpenAI-compatible endpoint (LM Studio, vLLM, Groq, etc.)",
+        "ollama": "Local models via Ollama — free, no API key (default)",
+        "openai": "OpenAI GPT-4o / o1 — requires OPENAI_API_KEY",
+        "anthropic": "Anthropic Claude — requires ANTHROPIC_API_KEY",
+        "openai_compat": "Any OpenAI-compatible endpoint (LM Studio, vLLM, Groq…)",
     }
     for p in list_providers():
         print(f"  {p:<18} {descriptions.get(p, '')}")
     print()
-    print("Set provider in config.yaml or WIKI_PROVIDER env var.")
-    print("Model aliases: hermes, lm_studio, vllm, groq, together → openai_compat")
+    print("Set via config.yaml or WIKI_PROVIDER env var.")
+    print("Aliases: hermes, lm_studio, vllm, groq, together → openai_compat\n")
+
+
+def cmd_doctor(args) -> None:
+    """Pre-flight check — verify everything is set up correctly."""
+    from .config import load_config
+    from .wiki_fs import WikiFS
+    from .utils.doctor import WikiDoctor
+
+    root = Path(args.root).resolve()
+    cfg = load_config(root)
+    if getattr(args, "provider", None):
+        cfg.provider = args.provider
+    if getattr(args, "model", None):
+        cfg.model = args.model
+
+    check_provider = not getattr(args, "no_health_check", False)
+
+    print(f"\n  Running wiki doctor on: {root}\n")
+    doctor = WikiDoctor(root, cfg)
+    report = doctor.run(check_provider=check_provider)
+
+    print(report.format(verbose=args.verbose))
+    print()
+
+    if report.passed:
+        _ok("All checks passed — wiki is ready to use.")
+    else:
+        n = len(report.failures)
+        _err(f"{n} check(s) failed. Fix the issues above then re-run: wiki doctor")
+        sys.exit(1)
+
+
+def cmd_usage(args) -> None:
+    """Show token usage and estimated cost summary."""
+    from .wiki_fs import WikiFS
+    from .utils.usage import UsageTracker
+    from datetime import date
+
+    root = Path(args.root).resolve()
+    tracker = UsageTracker(root)
+
+    since = None
+    since_str = getattr(args, "since", None)
+    if since_str:
+        try:
+            since = date.fromisoformat(since_str)
+        except ValueError:
+            _err(f"Invalid date format: {since_str!r}. Use YYYY-MM-DD.")
+            sys.exit(1)
+
+    print()
+    print(tracker.format_summary(since=since))
     print()
 
 
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Shared helpers
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+
 
 def _get_provider(args):
     from .config import load_config
@@ -298,13 +465,11 @@ def _get_provider(args):
         cfg.provider = args.provider
     if getattr(args, "model", None):
         cfg.model = args.model
-
     try:
-        provider = get_provider(cfg)
+        return get_provider(cfg)
     except Exception as exc:
-        _print_err(f"Could not initialise provider: {exc}")
+        _err(f"Could not initialise provider: {exc}")
         sys.exit(1)
-    return provider
 
 
 def _set_default_model(cfg) -> None:
@@ -320,75 +485,39 @@ def _set_default_model(cfg) -> None:
 def _default_agents_md(topic: str) -> str:
     return f"""# {topic} Wiki — Agent Schema
 # Provider-agnostic. Works with Ollama, OpenAI, Anthropic, or any compatible LLM.
-# Generated by llm-wiki-universal — edit to suit your domain.
 
-## Project Structure
+## Structure
+- raw/       Immutable source documents
+- wiki/      LLM-generated markdown pages
+- outputs/   Lint reports, exports
 
-- `raw/`          — Immutable source documents. Never modify.
-- `wiki/`         — LLM-generated and maintained markdown pages.
-- `wiki/index.md` — Master content catalog. Updated on every ingest.
-- `wiki/log.md`   — Append-only operation log.
-- `outputs/`      — Generated reports, lint results.
-
-## Page Types
-
-Every wiki page must have YAML frontmatter:
-
-```yaml
+## Page frontmatter
 ---
 title: Page Title
 type: concept | entity | source-summary | comparison | query-answer
-sources:
-  - raw/articles/filename.md
-related:
-  - "[[related-concept]]"
 created: YYYY-MM-DD
 updated: YYYY-MM-DD
 confidence: high | medium | low
 ---
-```
 
-## Naming
+## Naming: kebab-case files, [[wikilinks]] for cross-references
 
-- Filenames: kebab-case (e.g., `attention-mechanism.md`)
-- Cross-references: `[[wikilinks]]` for all internal links
-- Source references: always link back to `raw/` file paths
-
-## Ingest Workflow
-
-1. Read source document
-2. Identify key concepts and entities
-3. Create `wiki/sources/<source-name>.md` summary
-4. Update or create concept/entity pages with new information
-5. Update `wiki/index.md`
-6. Append to `wiki/log.md`
-
-## Query Workflow
-
-1. Read `wiki/index.md` to find relevant pages
-2. Read those pages and synthesise an answer
-3. Cite with `[[wikilinks]]`
-4. Offer to save valuable answers as new pages
-
-## Lint Workflow
-
-1. Scan for contradictions between pages
-2. Find orphan pages (no incoming links)
-3. Find missing pages (broken wikilinks)
-4. Flag low-confidence pages
-5. Save report to `outputs/lint-YYYY-MM-DD.md`
+## Workflows
+- Ingest: read raw/ → create/update wiki/ pages → update index.md → append log.md
+- Query:  index.md → relevant pages → synthesise answer with [[citations]]
+- Lint:   scan for contradictions, orphans, broken links → outputs/lint-DATE.md
 """
 
 
-def _print_ok(msg: str) -> None:
+def _ok(msg: str) -> None:
     print(f"\033[32m✓\033[0m {msg}")
 
 
-def _print_err(msg: str) -> None:
+def _err(msg: str) -> None:
     print(f"\033[31m✗\033[0m {msg}", file=sys.stderr)
 
 
-def _print_info(msg: str) -> None:
+def _info(msg: str) -> None:
     print(f"\033[34mℹ\033[0m {msg}")
 
 
