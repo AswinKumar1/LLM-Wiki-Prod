@@ -54,13 +54,16 @@ pip install -e .
 mkdir my-wiki && cd my-wiki
 wiki init                       # creates raw/, wiki/, AGENTS.md, config.yaml
 
-# 4. Add a source
+# 4. Add a source (file, PDF, or URL)
 cp ~/Downloads/some-article.md raw/articles/
+wiki ingest --url https://arxiv.org/abs/2005.11401
+wiki ingest raw/papers/attention.pdf
 
-# 5. Ingest
+# 5. Ingest everything in raw/
 wiki ingest
 
-# 6. Ask questions
+# 6. Search or ask questions
+wiki search "retrieval augmented generation"
 wiki query "What are the main ideas in this article?"
 ```
 
