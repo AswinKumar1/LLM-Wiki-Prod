@@ -1,11 +1,12 @@
 """
-Ingest operation — Day 2 upgrade.
+Ingest operation — Day 3 upgrade.
 
-New in Day 2:
-  - Automatic chunking for large source files (>6k tokens)
-  - Retry with exponential backoff on LLM errors
-  - Usage tracking (token counts written to wiki/usage.json)
-  - Chunk merge so the wiki gets consistent pages regardless of file size
+New in Day 3:
+  - PDF ingestion: wiki ingest raw/paper.pdf
+  - URL ingestion: wiki ingest --url https://...
+  - Source reader routing (text / pdf / url → unified text pipeline)
+
+Everything else (chunking, retry, usage tracking) carried forward from Day 2.
 """
 
 from __future__ import annotations
@@ -18,12 +19,12 @@ from typing import Optional
 from ..providers.base import LLMProvider
 from ..wiki_fs import WikiFS
 from ..prompts import ingest_source
-from ..utils.chunker import chunk_text, needs_chunking, merge_ingest_responses
+from ..utils.chunker import chunk_text, merge_ingest_responses
 from ..utils.usage import UsageTracker
+from ..utils.source_reader import read_source, is_url
 
-# Retry config
 _MAX_RETRIES = 3
-_RETRY_DELAYS = [2, 5, 10]  # seconds between retries
+_RETRY_DELAYS = [2, 5, 10]
 
 
 @dataclass
@@ -35,6 +36,7 @@ class IngestResult:
     tokens_used: int = 0
     cost_usd: float = 0.0
     chunks_processed: int = 1
+    source_type: str = "text"  # "text" | "pdf" | "url"
     error: Optional[str] = None
 
     @property
@@ -44,12 +46,13 @@ class IngestResult:
 
 class IngestOperation:
     """
-    Process one or more raw source files into wiki pages.
+    Process one or more raw source files (or URLs) into wiki pages.
 
     Usage:
         op = IngestOperation(provider, wiki_fs)
-        results = op.run()                      # all new sources
-        result  = op.run_one(path_to_source)    # specific file
+        results = op.run()                           # all new raw/ sources
+        result  = op.run_one(path)                   # specific file
+        result  = op.run_url("https://arxiv.org/…") # fetch + ingest URL
     """
 
     def __init__(
@@ -70,6 +73,7 @@ class IngestOperation:
     # ------------------------------------------------------------------
 
     def run(self, max_sources: Optional[int] = None) -> list[IngestResult]:
+        """Ingest all new un-processed files from raw/."""
         sources = self.fs.new_raw_sources()
         if not sources:
             return []
@@ -78,24 +82,65 @@ class IngestOperation:
         return [self.run_one(src) for src in sources]
 
     def run_one(self, source_path: Path) -> IngestResult:
+        """Ingest a single file — auto-detects PDF vs text."""
         source_name = source_path.name
         result = IngestResult(source_name=source_name)
 
         if self.verbose:
             print(f"  ingesting: {source_name} ...")
 
-        source_text = self.fs.read_source(source_path)
-        source_sha = self.fs.source_sha256(source_path)
+        # Route to correct reader
+        text, _, method = read_source(source_path)
+        result.source_type = method
+
+        if text is None:
+            result.error = method  # method holds the error message for failures
+            return result
+
+        return self._ingest_text(text, source_name, result)
+
+    def run_url(self, url: str) -> IngestResult:
+        """
+        Fetch a URL, save to raw/articles/, then ingest.
+        Returns an IngestResult with source_type='url'.
+        """
+        if self.verbose:
+            print(f"  fetching: {url} ...")
+
+        text, filename, method = read_source(url)
+        if text is None:
+            return IngestResult(
+                source_name=url,
+                source_type="url",
+                error=method,
+            )
+
+        # Save fetched content to raw/articles/ so it's tracked
+        raw_path = self.fs.raw_dir / "articles" / filename
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_path.write_text(text, encoding="utf-8")
+
+        if self.verbose:
+            print(f"  saved to: raw/articles/{filename}")
+
+        result = IngestResult(source_name=filename, source_type="url")
+        return self._ingest_text(text, filename, result)
+
+    # ------------------------------------------------------------------
+    # Shared ingest pipeline
+    # ------------------------------------------------------------------
+
+    def _ingest_text(self, text: str, source_name: str, result: IngestResult) -> IngestResult:
+        source_sha = _sha256_text(text)
         index_content = self.fs.read_index()
 
-        # ----- Chunking ------------------------------------------------
-        chunks = chunk_text(source_text, max_tokens=self.max_tokens_per_chunk)
+        # Chunk if needed
+        chunks = chunk_text(text, max_tokens=self.max_tokens_per_chunk)
         result.chunks_processed = len(chunks)
 
         if self.verbose and len(chunks) > 1:
-            print(f"    → splitting into {len(chunks)} chunks")
+            print(f"    → {len(chunks)} chunks")
 
-        # ----- LLM calls (one per chunk, with retry) -------------------
         chunk_responses: list[str] = []
         for chunk in chunks:
             if self.verbose and len(chunks) > 1:
@@ -111,18 +156,16 @@ class IngestOperation:
             chunk_responses.append(response)
             result.tokens_used += tokens
 
-            # Track usage per chunk
             cost = self._tracker.record(
                 op="ingest",
                 provider=self.provider.provider_name,
                 model=self.provider.model_name,
-                prompt_tokens=tokens // 2,  # rough split (exact not available per-chunk)
+                prompt_tokens=tokens // 2,
                 completion_tokens=tokens // 2,
                 source=source_name,
             )
             result.cost_usd += cost
 
-        # ----- Merge multi-chunk responses ----------------------------
         merged = merge_ingest_responses(chunk_responses, source_name)
         self._parse_and_write(merged, source_name, source_sha, result)
         return result
@@ -134,10 +177,6 @@ class IngestOperation:
     def _call_with_retry(
         self, system: str, user: str, source_name: str
     ) -> tuple[Optional[str], int]:
-        """
-        Call provider.chat() with exponential backoff.
-        Returns (content, total_tokens) or (None, 0) on permanent failure.
-        """
         last_exc = None
         for attempt in range(_MAX_RETRIES):
             try:
@@ -148,17 +187,14 @@ class IngestOperation:
                 if attempt < _MAX_RETRIES - 1:
                     delay = _RETRY_DELAYS[attempt]
                     if self.verbose:
-                        print(
-                            f"    ⚠ attempt {attempt + 1} failed ({exc}), retrying in {delay}s ..."
-                        )
+                        print(f"    ⚠ retry {attempt + 1} ({exc}), waiting {delay}s ...")
                     time.sleep(delay)
-
         if self.verbose:
-            print(f"    ✗ all retries exhausted for {source_name}: {last_exc}")
+            print(f"    ✗ retries exhausted for {source_name}: {last_exc}")
         return None, 0
 
     # ------------------------------------------------------------------
-    # Parse & write (unchanged from Day 1, kept here for self-containment)
+    # Parse & write
     # ------------------------------------------------------------------
 
     def _parse_and_write(
@@ -171,7 +207,6 @@ class IngestOperation:
         import re
 
         sections = _split_sections(llm_output)
-
         result.takeaways = sections.get("TAKEAWAYS", "").strip()
 
         summary = sections.get("SOURCE_SUMMARY_PAGE", "").strip()
@@ -195,22 +230,27 @@ class IngestOperation:
             self.fs.write_index(index_update)
 
         log_entry = sections.get("LOG_ENTRY", "").strip()
-        if log_entry:
-            self.fs.append_log(log_entry)
-        else:
-            self.fs.append_log(
+        self.fs.append_log(
+            log_entry
+            or (
                 f"ingest | {source_name} | "
                 f"{len(result.pages_created)} created, "
                 f"{len(result.pages_updated)} updated | "
                 f"{result.tokens_used} tokens"
             )
+        )
 
 
 # ---------------------------------------------------------------------------
-# Parsing utilities (duplicated from Day 1 to keep this file standalone)
+# Utilities
 # ---------------------------------------------------------------------------
 
 import re as _re
+import hashlib as _hashlib
+
+
+def _sha256_text(text: str) -> str:
+    return _hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
 
 
 def _split_sections(text: str) -> dict[str, str]:
@@ -249,10 +289,10 @@ def _parse_multipage_block(text: str) -> list[tuple[str, str]]:
     return pages
 
 
-def _inject_sha(frontmatter_page: str, sha: str) -> str:
-    if "source_sha:" not in frontmatter_page and "---" in frontmatter_page:
-        frontmatter_page = frontmatter_page.replace("---\n", f"---\nsource_sha: {sha}\n", 1)
-    return frontmatter_page
+def _inject_sha(page: str, sha: str) -> str:
+    if "source_sha:" not in page and "---" in page:
+        page = page.replace("---\n", f"---\nsource_sha: {sha}\n", 1)
+    return page
 
 
 def _slugify(name: str) -> str:

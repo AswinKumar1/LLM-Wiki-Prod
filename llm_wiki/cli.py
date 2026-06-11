@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-llm-wiki-universal CLI — Day 2 upgrade
+llm-wiki-universal CLI — Day 3 additions
 
 New commands:
-  wiki doctor   — pre-flight check: config, dirs, provider health
-  wiki usage    — show token usage and estimated cost summary
+  wiki search "query"          — BM25 keyword search, no LLM needed
+  wiki search "query" --rerank — BM25 + LLM answer synthesis
 
 Updated commands:
-  wiki query    — now supports --stream flag for live token output
-  wiki ingest   — now shows chunk progress and cost per source
-  wiki status   — now includes usage summary
+  wiki ingest --url https://…  — fetch URL, save to raw/, ingest
+  wiki ingest raw/paper.pdf    — extract PDF text, then ingest
+  wiki ingest                  — same as before, now handles PDFs in raw/
 """
 
 from __future__ import annotations
@@ -39,24 +39,26 @@ def main() -> None:
     p_init.add_argument("--model", default="")
 
     # ingest
-    p_ingest = sub.add_parser("ingest", help="Ingest raw sources into the wiki")
-    p_ingest.add_argument("--source", default=None)
+    p_ingest = sub.add_parser("ingest", help="Ingest sources into the wiki")
+    p_ingest.add_argument("--source", default=None, help="Specific file to ingest")
+    p_ingest.add_argument("--url", default=None, help="Fetch and ingest a URL")
     p_ingest.add_argument("--max", type=int, default=None)
-    p_ingest.add_argument(
-        "--chunk-size",
-        type=int,
-        default=6000,
-        help="Max tokens per chunk for large files (default: 6000)",
-    )
+    p_ingest.add_argument("--chunk-size", type=int, default=6000)
 
     # query
     p_query = sub.add_parser("query", help="Ask a question against the wiki")
     p_query.add_argument("question")
     p_query.add_argument("--save", action="store_true")
-    p_query.add_argument(
-        "--stream",
-        action="store_true",
-        help="Stream tokens as they arrive (requires provider stream support)",
+    p_query.add_argument("--stream", action="store_true")
+
+    # search  ← NEW
+    p_search = sub.add_parser("search", help="BM25 keyword search (no LLM required)")
+    p_search.add_argument("query", help="Search terms")
+    p_search.add_argument(
+        "--top", "-n", type=int, default=10, help="Number of results (default: 10)"
+    )
+    p_search.add_argument(
+        "--rerank", action="store_true", help="Use LLM to synthesise an answer from top results"
     )
 
     # lint
@@ -68,21 +70,13 @@ def main() -> None:
     # providers
     sub.add_parser("providers", help="List supported providers")
 
-    # doctor  ← NEW
-    p_doctor = sub.add_parser("doctor", help="Pre-flight check: config, dirs, provider")
-    p_doctor.add_argument(
-        "--no-health-check",
-        action="store_true",
-        help="Skip provider reachability check (useful offline)",
-    )
+    # doctor
+    p_doctor = sub.add_parser("doctor", help="Pre-flight check")
+    p_doctor.add_argument("--no-health-check", action="store_true")
 
-    # usage  ← NEW
-    p_usage = sub.add_parser("usage", help="Show token usage and cost summary")
-    p_usage.add_argument(
-        "--since",
-        default=None,
-        help="Filter to entries on or after this date (YYYY-MM-DD)",
-    )
+    # usage
+    p_usage = sub.add_parser("usage", help="Token usage and cost summary")
+    p_usage.add_argument("--since", default=None)
 
     args = parser.parse_args()
 
@@ -90,6 +84,7 @@ def main() -> None:
         "init": cmd_init,
         "ingest": cmd_ingest,
         "query": cmd_query,
+        "search": cmd_search,
         "lint": cmd_lint,
         "status": cmd_status,
         "providers": cmd_providers,
@@ -131,16 +126,14 @@ def cmd_init(args) -> None:
         topic = getattr(args, "topic", "") or "General"
         fs.agents_md_path.write_text(_default_agents_md(topic))
         _ok("Created AGENTS.md")
-    else:
-        _info("AGENTS.md already exists — skipped")
 
     gitignore = root / ".gitignore"
     if not gitignore.exists():
-        gitignore.write_text("outputs/*.pdf\n__pycache__/\n*.pyc\n.env\n")
+        gitignore.write_text("outputs/\n__pycache__/\n*.pyc\n.env\n")
         _ok("Created .gitignore")
 
     _ok(f"\nWiki initialised at: {root}")
-    print(f"\n  Next: drop files into {root}/raw/articles/  then  wiki ingest")
+    print(f"\n  Next: wiki ingest --url https://...  or  drop files into raw/")
 
 
 def cmd_ingest(args) -> None:
@@ -156,37 +149,32 @@ def cmd_ingest(args) -> None:
         max_tokens_per_chunk=getattr(args, "chunk_size", 6000),
     )
 
+    url = getattr(args, "url", None)
+    if url:
+        _info(f"Fetching: {url}")
+        result = op.run_url(url)
+        _print_ingest_result(result, args.verbose)
+        return
+
     if args.source:
         source_path = Path(args.source)
         if not source_path.exists():
-            _err(f"Source file not found: {args.source}")
+            _err(f"File not found: {args.source}")
             sys.exit(1)
         results = [op.run_one(source_path)]
     else:
         results = op.run(max_sources=getattr(args, "max", None))
 
     if not results:
-        _info("No new sources to ingest. Drop files into raw/ first.")
+        _info("No new sources to ingest. Drop files into raw/ or use --url.")
         return
 
     total_tokens = 0
     total_cost = 0.0
     for r in results:
-        if r.success:
-            chunk_note = f" ({r.chunks_processed} chunks)" if r.chunks_processed > 1 else ""
-            cost_note = f"  ${r.cost_usd:.4f}" if r.cost_usd > 0 else ""
-            _ok(
-                f"{r.source_name}{chunk_note}: "
-                f"{len(r.pages_created)} created, "
-                f"{len(r.pages_updated)} updated  "
-                f"[{r.tokens_used} tokens{cost_note}]"
-            )
-            if args.verbose and r.takeaways:
-                print(f"\n  Takeaways:\n{r.takeaways}\n")
-            total_tokens += r.tokens_used
-            total_cost += r.cost_usd
-        else:
-            _err(f"{r.source_name}: FAILED — {r.error}")
+        _print_ingest_result(r, args.verbose)
+        total_tokens += r.tokens_used
+        total_cost += r.cost_usd
 
     if len(results) > 1:
         cost_str = f"  total cost: ${total_cost:.4f}" if total_cost > 0 else ""
@@ -203,7 +191,6 @@ def cmd_query(args) -> None:
     tracker = UsageTracker(fs.root)
     op = QueryOperation(provider, fs, verbose=args.verbose)
 
-    # Streaming path
     if getattr(args, "stream", False):
         _run_streaming_query(provider, fs, op, args, tracker)
         return
@@ -223,78 +210,55 @@ def cmd_query(args) -> None:
             )
             if args.verbose:
                 cost_str = f"  ${cost:.4f}" if cost > 0 else ""
-                print(f"  Pages read:   {result.pages_read}")
-                print(f"  Tokens used:  {result.tokens_used:,}{cost_str}")
+                print(f"  Pages: {result.pages_read}")
+                print(f"  Tokens: {result.tokens_used:,}{cost_str}")
         if result.saved_to:
-            _ok(f"Answer saved to: {result.saved_to}")
+            _ok(f"Saved to: {result.saved_to}")
     else:
         _err(f"Query failed: {result.error}")
         sys.exit(1)
 
 
-def _run_streaming_query(provider, fs, op, args, tracker) -> None:
-    """Stream tokens to stdout as they arrive."""
-    from .prompts import query_find_relevant_pages, query_question
+def cmd_search(args) -> None:
+    """BM25 keyword search — no LLM call unless --rerank is set."""
+    from .wiki_fs import WikiFS
+    from .operations.search import SearchOperation
 
-    index_content = fs.read_index()
-    if not index_content.strip():
-        _err("Wiki index is empty. Run `wiki ingest` first.")
+    fs = WikiFS(Path(args.root).resolve())
+
+    # Only initialise provider if reranking is requested
+    if getattr(args, "rerank", False):
+        provider = _get_provider(args)
+    else:
+        provider = _null_provider()
+
+    op = SearchOperation(provider, fs, verbose=args.verbose)
+    resp = op.search(
+        args.query,
+        top_k=getattr(args, "top", 10),
+        rerank=getattr(args, "rerank", False),
+    )
+
+    if not resp.success:
+        _err(resp.error or "Search failed")
         sys.exit(1)
 
-    # Step 1: find relevant pages (non-streaming, fast)
-    sys_fp, usr_fp = query_find_relevant_pages(args.question, index_content)
-    try:
-        page_resp = provider.chat(sys_fp, usr_fp, max_tokens=512)
-    except Exception as exc:
-        _err(f"Failed to find relevant pages: {exc}")
-        sys.exit(1)
+    print(f'\n  Search: "{args.query}"  ({resp.total_docs_searched} pages indexed)\n')
 
-    import json, re
+    if not resp.found:
+        _info("No results found. Try broader search terms.")
+        return
 
-    paths: list[str] = []
-    try:
-        match = re.search(r"\[.*?\]", page_resp.content, re.DOTALL)
-        if match:
-            paths = json.loads(match.group())
-    except Exception:
-        paths = [str(fs.relative_to_root(p)) for p in fs.list_wiki_pages()[:8]]
+    for i, result in enumerate(resp.results, 1):
+        print(result.format(i))
 
-    pages: dict[str, str] = {}
-    for path in paths:
-        content = fs.read_wiki_page(path)
-        if content:
-            pages[path] = content
-
-    if not pages:
-        pages = {"wiki/index.md": index_content}
+    if resp.answer:
+        print("  ─" * 20)
+        print(f"\n  Answer:\n")
+        print(f"  {resp.answer}\n")
 
     if args.verbose:
-        print(f"  Reading: {list(pages.keys())}\n")
-
-    # Step 2: stream the answer
-    system, user = query_question(args.question, pages)
-    print()
-    total_chars = 0
-    try:
-        for token in provider.stream(system, user):
-            print(token, end="", flush=True)
-            total_chars += len(token)
-    except Exception as exc:
-        print()
-        _err(f"Streaming error: {exc}")
-        sys.exit(1)
-
-    print("\n")
-
-    # Rough token estimate from chars streamed
-    approx_tokens = total_chars // 4
-    tracker.record(
-        op="query",
-        provider=provider.provider_name,
-        model=provider.model_name,
-        prompt_tokens=approx_tokens,
-        completion_tokens=approx_tokens,
-    )
+        print(f"  Tokens used: {resp.tokens_used}")
 
 
 def cmd_lint(args) -> None:
@@ -334,6 +298,7 @@ def cmd_status(args) -> None:
     from .wiki_fs import WikiFS
     from .providers.factory import get_provider
     from .utils.usage import UsageTracker
+    from .utils.search import BM25Index
 
     root = Path(args.root).resolve()
     cfg = load_config(root)
@@ -356,6 +321,10 @@ def cmd_status(args) -> None:
     print(f"  Wiki pages:  {len(pages)}")
     print(f"  Raw sources: {len(sources)}  ({len(new_sources)} unprocessed)")
 
+    if pages:
+        index = BM25Index.build(fs)
+        print(f"  Search index:{index.doc_count} docs, {index.vocab_size} terms")
+
     log = fs.read_log(3)
     if log:
         print(f"  Recent ops:")
@@ -366,7 +335,7 @@ def cmd_status(args) -> None:
     if summary["total_calls"] > 0:
         print(f"{'─' * 44}")
         print(
-            f"  Token usage: {summary['total_prompt_tokens'] + summary['total_completion_tokens']:,} total"
+            f"  Tokens:      {summary['total_prompt_tokens'] + summary['total_completion_tokens']:,} total"
         )
         print(f"  Est. cost:   ${summary['total_cost_usd']:.4f} USD")
 
@@ -393,12 +362,9 @@ def cmd_providers(args) -> None:
     for p in list_providers():
         print(f"  {p:<18} {descriptions.get(p, '')}")
     print()
-    print("Set via config.yaml or WIKI_PROVIDER env var.")
-    print("Aliases: hermes, lm_studio, vllm, groq, together → openai_compat\n")
 
 
 def cmd_doctor(args) -> None:
-    """Pre-flight check — verify everything is set up correctly."""
     from .config import load_config
     from .wiki_fs import WikiFS
     from .utils.doctor import WikiDoctor
@@ -411,47 +377,98 @@ def cmd_doctor(args) -> None:
         cfg.model = args.model
 
     check_provider = not getattr(args, "no_health_check", False)
-
     print(f"\n  Running wiki doctor on: {root}\n")
     doctor = WikiDoctor(root, cfg)
     report = doctor.run(check_provider=check_provider)
-
     print(report.format(verbose=args.verbose))
     print()
-
     if report.passed:
-        _ok("All checks passed — wiki is ready to use.")
+        _ok("All checks passed — wiki is ready.")
     else:
-        n = len(report.failures)
-        _err(f"{n} check(s) failed. Fix the issues above then re-run: wiki doctor")
+        _err(f"{len(report.failures)} check(s) failed.")
         sys.exit(1)
 
 
 def cmd_usage(args) -> None:
-    """Show token usage and estimated cost summary."""
     from .wiki_fs import WikiFS
     from .utils.usage import UsageTracker
     from datetime import date
 
     root = Path(args.root).resolve()
     tracker = UsageTracker(root)
-
     since = None
     since_str = getattr(args, "since", None)
     if since_str:
         try:
             since = date.fromisoformat(since_str)
         except ValueError:
-            _err(f"Invalid date format: {since_str!r}. Use YYYY-MM-DD.")
+            _err(f"Invalid date: {since_str!r}  (use YYYY-MM-DD)")
             sys.exit(1)
-
     print()
     print(tracker.format_summary(since=since))
     print()
 
 
 # ---------------------------------------------------------------------------
-# Shared helpers
+# Streaming query (carried from Day 2)
+# ---------------------------------------------------------------------------
+
+
+def _run_streaming_query(provider, fs, op, args, tracker) -> None:
+    from .prompts import query_find_relevant_pages, query_question
+    import json, re
+
+    index_content = fs.read_index()
+    if not index_content.strip():
+        _err("Wiki index is empty. Run `wiki ingest` first.")
+        sys.exit(1)
+
+    sys_fp, usr_fp = query_find_relevant_pages(args.question, index_content)
+    try:
+        page_resp = provider.chat(sys_fp, usr_fp, max_tokens=512)
+    except Exception as exc:
+        _err(f"Failed to find pages: {exc}")
+        sys.exit(1)
+
+    paths: list[str] = []
+    try:
+        match = re.search(r"\[.*?\]", page_resp.content, re.DOTALL)
+        if match:
+            paths = json.loads(match.group())
+    except Exception:
+        paths = [str(fs.relative_to_root(p)) for p in fs.list_wiki_pages()[:8]]
+
+    pages: dict[str, str] = {}
+    for path in paths:
+        content = fs.read_wiki_page(path)
+        if content:
+            pages[path] = content
+    if not pages:
+        pages = {"wiki/index.md": index_content}
+
+    system, user = query_question(args.question, pages)
+    print()
+    total_chars = 0
+    try:
+        for token in provider.stream(system, user):
+            print(token, end="", flush=True)
+            total_chars += len(token)
+    except Exception as exc:
+        print()
+        _err(f"Stream error: {exc}")
+        sys.exit(1)
+    print("\n")
+    tracker.record(
+        op="query",
+        provider=provider.provider_name,
+        model=provider.model_name,
+        prompt_tokens=total_chars // 4,
+        completion_tokens=total_chars // 4,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
 # ---------------------------------------------------------------------------
 
 
@@ -468,8 +485,43 @@ def _get_provider(args):
     try:
         return get_provider(cfg)
     except Exception as exc:
-        _err(f"Could not initialise provider: {exc}")
+        _err(f"Provider init failed: {exc}")
         sys.exit(1)
+
+
+def _null_provider():
+    """Placeholder provider for search without --rerank."""
+    from .providers.base import LLMProvider, LLMResponse, ProviderConfig
+
+    class NullProvider(LLMProvider):
+        def chat(self, *a, **kw):
+            return LLMResponse(content="", model="null", provider="null")
+
+        def health_check(self):
+            return True
+
+        @property
+        def provider_name(self):
+            return "null"
+
+    return NullProvider(ProviderConfig())
+
+
+def _print_ingest_result(r, verbose: bool) -> None:
+    if r.success:
+        type_tag = f" [{r.source_type}]" if r.source_type != "text" else ""
+        chunk_note = f" ({r.chunks_processed} chunks)" if r.chunks_processed > 1 else ""
+        cost_note = f"  ${r.cost_usd:.4f}" if r.cost_usd > 0 else ""
+        _ok(
+            f"{r.source_name}{type_tag}{chunk_note}: "
+            f"{len(r.pages_created)} created, "
+            f"{len(r.pages_updated)} updated  "
+            f"[{r.tokens_used} tokens{cost_note}]"
+        )
+        if verbose and r.takeaways:
+            print(f"\n  Takeaways:\n{r.takeaways}\n")
+    else:
+        _err(f"{r.source_name}: FAILED — {r.error}")
 
 
 def _set_default_model(cfg) -> None:
@@ -483,30 +535,18 @@ def _set_default_model(cfg) -> None:
 
 
 def _default_agents_md(topic: str) -> str:
-    return f"""# {topic} Wiki — Agent Schema
-# Provider-agnostic. Works with Ollama, OpenAI, Anthropic, or any compatible LLM.
-
-## Structure
-- raw/       Immutable source documents
-- wiki/      LLM-generated markdown pages
-- outputs/   Lint reports, exports
-
-## Page frontmatter
----
-title: Page Title
-type: concept | entity | source-summary | comparison | query-answer
-created: YYYY-MM-DD
-updated: YYYY-MM-DD
-confidence: high | medium | low
----
-
-## Naming: kebab-case files, [[wikilinks]] for cross-references
-
-## Workflows
-- Ingest: read raw/ → create/update wiki/ pages → update index.md → append log.md
-- Query:  index.md → relevant pages → synthesise answer with [[citations]]
-- Lint:   scan for contradictions, orphans, broken links → outputs/lint-DATE.md
-"""
+    return (
+        f"# {topic} Wiki — Agent Schema\n"
+        "# Provider-agnostic. Works with Ollama, OpenAI, Anthropic, or any compatible LLM.\n\n"
+        "## Structure\n"
+        "- raw/       Immutable sources (.md .txt .pdf or fetched URLs)\n"
+        "- wiki/      LLM-generated markdown pages\n"
+        "- outputs/   Lint reports, exports\n\n"
+        "## Page frontmatter\n"
+        "---\ntitle: Page Title\ntype: concept | entity | source-summary\n"
+        "created: YYYY-MM-DD\nupdated: YYYY-MM-DD\nconfidence: high | medium | low\n---\n\n"
+        "## Naming: kebab-case files, [[wikilinks]] for cross-references\n"
+    )
 
 
 def _ok(msg: str) -> None:
