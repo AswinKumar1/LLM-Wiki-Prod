@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-llm-wiki-universal CLI — Day 3 additions
+llm-wiki-universal CLI — Day 4 additions
 
 New commands:
-  wiki search "query"          — BM25 keyword search, no LLM needed
-  wiki search "query" --rerank — BM25 + LLM answer synthesis
+  wiki nli                 — standalone NLI contradiction scan (no full lint)
+  wiki nli --backend llm   — force LLM backend
+  wiki nli --backend cross_encoder — force cross-encoder backend
 
 Updated commands:
-  wiki ingest --url https://…  — fetch URL, save to raw/, ingest
-  wiki ingest raw/paper.pdf    — extract PDF text, then ingest
-  wiki ingest                  — same as before, now handles PDFs in raw/
+  wiki lint                — now runs NLI pass automatically
+  wiki lint --skip-nli     — structural checks only (fast)
+  wiki lint --nli-backend cross_encoder  — force a specific backend
 """
 
 from __future__ import annotations
@@ -40,8 +41,8 @@ def main() -> None:
 
     # ingest
     p_ingest = sub.add_parser("ingest", help="Ingest sources into the wiki")
-    p_ingest.add_argument("--source", default=None, help="Specific file to ingest")
-    p_ingest.add_argument("--url", default=None, help="Fetch and ingest a URL")
+    p_ingest.add_argument("--source", default=None)
+    p_ingest.add_argument("--url", default=None)
     p_ingest.add_argument("--max", type=int, default=None)
     p_ingest.add_argument("--chunk-size", type=int, default=6000)
 
@@ -51,18 +52,40 @@ def main() -> None:
     p_query.add_argument("--save", action="store_true")
     p_query.add_argument("--stream", action="store_true")
 
-    # search  ← NEW
-    p_search = sub.add_parser("search", help="BM25 keyword search (no LLM required)")
-    p_search.add_argument("query", help="Search terms")
-    p_search.add_argument(
-        "--top", "-n", type=int, default=10, help="Number of results (default: 10)"
+    # search
+    p_search = sub.add_parser("search", help="BM25 keyword search")
+    p_search.add_argument("query")
+    p_search.add_argument("--top", "-n", type=int, default=10)
+    p_search.add_argument("--rerank", action="store_true")
+
+    # lint  ← updated
+    p_lint = sub.add_parser("lint", help="Health-check the wiki (includes NLI)")
+    p_lint.add_argument(
+        "--skip-nli",
+        action="store_true",
+        help="Skip NLI contradiction detection (structural checks only)",
     )
-    p_search.add_argument(
-        "--rerank", action="store_true", help="Use LLM to synthesise an answer from top results"
+    p_lint.add_argument(
+        "--nli-backend",
+        default="auto",
+        choices=["auto", "llm", "cross_encoder"],
+        help="NLI backend to use (default: auto)",
     )
 
-    # lint
-    sub.add_parser("lint", help="Health-check the wiki")
+    # nli  ← NEW
+    p_nli = sub.add_parser("nli", help="Standalone NLI contradiction scan")
+    p_nli.add_argument(
+        "--backend",
+        default="auto",
+        choices=["auto", "llm", "cross_encoder"],
+        help="NLI backend (default: auto — uses cross_encoder if installed)",
+    )
+    p_nli.add_argument(
+        "--max-pairs",
+        type=int,
+        default=300,
+        help="Max claim pairs to check (default: 300)",
+    )
 
     # status
     sub.add_parser("status", help="Show wiki stats and provider health")
@@ -86,6 +109,7 @@ def main() -> None:
         "query": cmd_query,
         "search": cmd_search,
         "lint": cmd_lint,
+        "nli": cmd_nli,
         "status": cmd_status,
         "providers": cmd_providers,
         "doctor": cmd_doctor,
@@ -220,13 +244,10 @@ def cmd_query(args) -> None:
 
 
 def cmd_search(args) -> None:
-    """BM25 keyword search — no LLM call unless --rerank is set."""
     from .wiki_fs import WikiFS
     from .operations.search import SearchOperation
 
     fs = WikiFS(Path(args.root).resolve())
-
-    # Only initialise provider if reranking is requested
     if getattr(args, "rerank", False):
         provider = _get_provider(args)
     else:
@@ -254,43 +275,119 @@ def cmd_search(args) -> None:
 
     if resp.answer:
         print("  ─" * 20)
-        print(f"\n  Answer:\n")
-        print(f"  {resp.answer}\n")
-
-    if args.verbose:
-        print(f"  Tokens used: {resp.tokens_used}")
+        print(f"\n  Answer:\n\n  {resp.answer}\n")
 
 
 def cmd_lint(args) -> None:
+    """Run full lint including NLI contradiction detection."""
     provider = _get_provider(args)
     from .wiki_fs import WikiFS
     from .operations.lint import LintOperation
 
     fs = WikiFS(Path(args.root).resolve())
-    op = LintOperation(provider, fs, verbose=args.verbose)
-    result = op.run()
+    op = LintOperation(
+        provider,
+        fs,
+        verbose=args.verbose,
+        nli_backend=getattr(args, "nli_backend", "auto"),
+    )
+    skip_nli = getattr(args, "skip_nli", False)
+    result = op.run(skip_nli=skip_nli)
 
-    if result.success:
-        _ok(f"Lint complete — {result.issue_count} issues found")
-        if result.contradictions:
-            print(f"\n  Contradictions ({len(result.contradictions)}):")
-            for c in result.contradictions:
-                print(f"    • {c}")
-        if result.orphan_pages:
-            print(f"\n  Orphan pages ({len(result.orphan_pages)}):")
-            for p in result.orphan_pages:
-                print(f"    • {p}")
-        if result.missing_pages:
-            print(f"\n  Missing pages ({len(result.missing_pages)}):")
-            for p in result.missing_pages:
-                print(f"    • [[{p}]]")
-        if result.summary:
-            print(f"\n  Summary: {result.summary}")
-        if result.output_path:
-            _info(f"Full report: {result.output_path}")
-    else:
+    if not result.success:
         _err(f"Lint failed: {result.error}")
         sys.exit(1)
+
+    _ok(f"Lint complete — {result.issue_count} total issues")
+
+    # NLI results
+    if not skip_nli:
+        print(
+            f"\n  NLI scan ({result.nli_backend} backend): "
+            f"{result.nli_pages_checked} pages, "
+            f"{result.nli_pairs_checked} pairs checked"
+        )
+        if result.nli_contradictions:
+            print(f"\n  Contradictions ({len(result.nli_contradictions)}):")
+            for c in result.nli_contradictions:
+                print(c.format())
+        else:
+            print("  Contradictions: none found ✓")
+        if result.pages_downgraded:
+            print(f"\n  Confidence downgraded: {len(result.pages_downgraded)} page(s)")
+            for p in result.pages_downgraded:
+                print(f"    • {p}")
+
+    # Structural results
+    if result.orphan_pages:
+        print(f"\n  Orphan pages ({len(result.orphan_pages)}):")
+        for p in result.orphan_pages:
+            print(f"    • {p}")
+    if result.missing_pages:
+        print(f"\n  Missing pages ({len(result.missing_pages)}):")
+        for p in result.missing_pages:
+            print(f"    • [[{p}]]")
+    if result.summary:
+        print(f"\n  Summary: {result.summary}")
+    if result.output_path:
+        _info(f"\n  Full report: {result.output_path}")
+
+
+def cmd_nli(args) -> None:
+    """Standalone NLI contradiction scan — faster than full lint."""
+    provider = _get_provider(args)
+    from .wiki_fs import WikiFS
+    from ..llm_wiki.utils.nli import NLIEngine
+
+    fs = WikiFS(Path(args.root).resolve())
+    pages_paths = fs.list_wiki_pages()
+
+    if not pages_paths:
+        _err("No wiki pages found. Run `wiki ingest` first.")
+        sys.exit(1)
+
+    # Load all pages
+    pages: dict[str, str] = {}
+    for p in pages_paths:
+        rel = fs.relative_to_root(p)
+        pages[rel] = p.read_text(encoding="utf-8", errors="replace")
+
+    backend = getattr(args, "backend", "auto")
+    max_pairs = getattr(args, "max_pairs", 300)
+
+    print(f"\n  NLI scan: {len(pages)} pages, backend={backend}\n")
+
+    try:
+        engine = NLIEngine(provider, backend=backend, verbose=args.verbose)
+        _info(f"Using backend: {engine.backend_name}")
+    except ImportError as exc:
+        _err(str(exc))
+        sys.exit(1)
+
+    result = engine.scan_pages(pages, max_pairs=max_pairs)
+
+    if not result.success:
+        _err(f"NLI scan failed: {result.error}")
+        sys.exit(1)
+
+    print(f"\n  Pages checked:      {result.pages_checked}")
+    print(f"  Claim pairs scored: {result.pairs_checked}")
+    print(f"  Contradictions:     {result.contradiction_count}\n")
+
+    if result.contradictions:
+        print("  Contradictions found:\n")
+        for c in result.contradictions:
+            print(c.format())
+
+        # Offer to downgrade confidence
+        affected = result.pages_with_contradictions()
+        print(f"  Affected pages: {len(affected)}")
+        for p in sorted(affected):
+            print(f"    • {p}")
+        print()
+        _info("Run `wiki lint` to downgrade confidence and save a full report.")
+    else:
+        _ok("No contradictions detected.")
 
 
 def cmd_status(args) -> None:
@@ -323,7 +420,7 @@ def cmd_status(args) -> None:
 
     if pages:
         index = BM25Index.build(fs)
-        print(f"  Search index:{index.doc_count} docs, {index.vocab_size} terms")
+        print(f"  Search idx:  {index.doc_count} docs, {index.vocab_size} terms")
 
     log = fs.read_log(3)
     if log:
@@ -334,9 +431,8 @@ def cmd_status(args) -> None:
     summary = tracker.summary()
     if summary["total_calls"] > 0:
         print(f"{'─' * 44}")
-        print(
-            f"  Tokens:      {summary['total_prompt_tokens'] + summary['total_completion_tokens']:,} total"
-        )
+        total_tok = summary["total_prompt_tokens"] + summary["total_completion_tokens"]
+        print(f"  Tokens:      {total_tok:,} total")
         print(f"  Est. cost:   ${summary['total_cost_usd']:.4f} USD")
 
     print(f"{'─' * 44}")
@@ -390,7 +486,6 @@ def cmd_doctor(args) -> None:
 
 
 def cmd_usage(args) -> None:
-    from .wiki_fs import WikiFS
     from .utils.usage import UsageTracker
     from datetime import date
 
@@ -410,7 +505,7 @@ def cmd_usage(args) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Streaming query (carried from Day 2)
+# Streaming query (carried from Day 2/3)
 # ---------------------------------------------------------------------------
 
 
@@ -490,7 +585,6 @@ def _get_provider(args):
 
 
 def _null_provider():
-    """Placeholder provider for search without --rerank."""
     from .providers.base import LLMProvider, LLMResponse, ProviderConfig
 
     class NullProvider(LLMProvider):
@@ -541,7 +635,7 @@ def _default_agents_md(topic: str) -> str:
         "## Structure\n"
         "- raw/       Immutable sources (.md .txt .pdf or fetched URLs)\n"
         "- wiki/      LLM-generated markdown pages\n"
-        "- outputs/   Lint reports, exports\n\n"
+        "- outputs/   Lint reports, NLI reports\n\n"
         "## Page frontmatter\n"
         "---\ntitle: Page Title\ntype: concept | entity | source-summary\n"
         "created: YYYY-MM-DD\nupdated: YYYY-MM-DD\nconfidence: high | medium | low\n---\n\n"

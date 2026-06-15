@@ -65,6 +65,9 @@ wiki ingest
 # 6. Search or ask questions
 wiki search "retrieval augmented generation"
 wiki query "What are the main ideas in this article?"
+
+# 7. Check for contradictions
+wiki nli
 ```
 
 ### Option B — OpenAI
@@ -109,7 +112,12 @@ pip install -e .            # installs the `wiki` CLI command
 ```
 
 **No required dependencies beyond the Python standard library.**  
-Optional: `pip install pyyaml` for cleaner config parsing.
+Optional: 
+```bash
+pip install pyyaml                  # cleaner config parsing
+pip install pdfminer.six            # PDF ingestion (recommended)
+pip install sentence-transformers   # NLI cross-encoder (more accurate contradiction detection)
+```
 
 ---
 
@@ -133,6 +141,29 @@ Optional: `pip install pyyaml` for cleaner config parsing.
 --model NAME     Override model from config
 --verbose / -v   Verbose output
 ```
+
+### Quality & integrity
+ 
+| Command | Description |
+|---------|-------------|
+| `wiki lint` | Full health-check including NLI contradiction scan |
+| `wiki lint --skip-nli` | Structural checks only (fast) |
+| `wiki lint --nli-backend cross_encoder` | Force cross-encoder NLI |
+| `wiki nli` | Standalone NLI contradiction scan |
+| `wiki nli --backend llm` | Force LLM backend for NLI |
+| `wiki nli --backend cross_encoder` | Force cross-encoder backend |
+
+### Diagnostics & monitoring
+ 
+| Command | Description |
+|---------|-------------|
+| `wiki doctor` | Pre-flight check: config, dirs, API keys, provider health |
+| `wiki status` | Wiki stats, search index size, recent ops |
+| `wiki usage` | Token usage and estimated cost summary |
+| `wiki usage --since 2025-06-01` | Filter usage to a date range |
+| `wiki providers` | List all supported providers |
+ 
+**Global flags:** `--root PATH`, `--provider NAME`, `--model NAME`, `--verbose / -v`
 
 ---
 
@@ -173,49 +204,81 @@ my-wiki/
 ---
 
 ## How it works
-
-Karpathy's pattern has three operations:
-
+ 
 ### Ingest
-Drop a file into `raw/` and run `wiki ingest`. The LLM:
-1. Reads the source
-2. Creates a summary in `wiki/sources/`
-3. Updates or creates concept and entity pages
-4. Updates `wiki/index.md`
-5. Appends to `wiki/log.md`
-
-A single ingest typically touches 5–15 wiki pages. Every source file is SHA-256 fingerprinted so re-ingesting is safe.
-
-### Query
-`wiki query "your question"` navigates the index, reads relevant pages, and synthesises an answer with `[[wikilink]]` citations. Good answers can be saved back into the wiki with `--save`, so your explorations compound.
-
+Drop any file into `raw/` or use `--url`. Supports `.md`, `.txt`, `.pdf`, and any URL. Large files (> 6k tokens) are auto-chunked. Failed calls retry 3× with backoff. Every source is SHA-256 fingerprinted.
+ 
+### Search (BM25 — no LLM)
+`wiki search "terms"` builds an in-memory BM25 index and returns ranked results in under 10ms. No API call, no embeddings, no vector database. Add `--rerank` for a synthesised LLM answer.
+ 
+### Query (LLM)
+Navigates the index, reads relevant pages, synthesises an answer with `[[wikilink]]` citations. Use `--stream` for live output. Save answers with `--save`.
+ 
+### NLI Contradiction Detection (Day 4)
+`wiki nli` scans all wiki pages for semantic contradictions at the sentence level.
+ 
+**Two backends:**
+- **LLM backend** (default, zero new deps): asks your configured LLM to classify sentence pairs as `ENTAILMENT / NEUTRAL / CONTRADICTION`. Works with Ollama, OpenAI, anything.
+- **Cross-encoder backend** (optional, more accurate): uses `sentence-transformers` MiniLM, ~80MB, runs locally. ~0.84 F1 on NLI benchmarks.
+```bash
+# Install for better accuracy
+pip install sentence-transformers
+ 
+# Run standalone
+wiki nli
+ 
+# Or as part of full lint
+wiki lint
+```
+ 
+When a contradiction is confirmed, the `confidence:` field in the affected page's frontmatter is automatically downgraded (`high → medium → low`), surfacing the issue in future search results and queries.
+ 
 ### Lint
-`wiki lint` runs a health check:
-- Contradictions between pages
-- Orphan pages with no incoming links
-- Broken `[[wikilinks]]` pointing nowhere
-- Low-confidence pages needing review
-- Missing frontmatter
-
-Results are saved to `outputs/lint-YYYY-MM-DD.md`.
-
+Full health-check: NLI contradictions (sentence-level, cited, scored), orphan pages, broken wikilinks, low-confidence pages, missing frontmatter. Report saved to `outputs/lint-YYYY-MM-DD.md`.
+ 
 ---
-
+ 
+## Large file handling
+ 
+Files over ~6,000 tokens are automatically split into overlapping chunks:
+ 
+```bash
+wiki ingest --chunk-size 4000    # smaller chunks for 3B models
+wiki ingest --chunk-size 8000    # larger chunks for GPT-4o
+```
+ 
+---
+ 
+## Token usage tracking
+ 
+```bash
+wiki usage                       # all-time
+wiki usage --since 2025-06-01    # from a date
+```
+ 
+Cost estimates for OpenAI and Anthropic. Ollama always shows $0.00.
+ 
+---
+ 
 ## vs RAG vs Karpathy's original
-
+ 
 | | Standard RAG | Karpathy's Base Wiki | **This project** |
 |--|--|--|--|
 | Provider | Any | Claude Code only | **Any (Ollama, OpenAI, Anthropic, custom)** |
 | Infrastructure | Vector DB + embeddings | None | **None** |
-| Query latency | 1–3s | LLM-dependent | LLM-dependent |
+| Keyword search | Vector similarity | None | **BM25 (stdlib, no deps)** |
+| Contradiction detection | No | Manual | **NLI sentence-level, auto-cited (Day 4)** |
+| Confidence tracking | No | Manual | **Auto-downgraded on contradiction** |
+| PDF ingestion | Requires setup | Manual | **Built-in** |
+| URL ingestion | Manual | Manual | **Built-in** |
+| Large file handling | Chunked at query | Manual | **Auto-chunked at ingest** |
 | Knowledge compounds | No | Yes | **Yes** |
-| Citation tracing | Chunk-level | File-level | **File-level + SHA-256** |
-| Contradiction detection | No | Manual lint | **Automated lint** |
+| Retry on failure | No | No | **3× exponential backoff** |
+| Cost visibility | No | No | **wiki usage** |
 | Free tier | Vendor-dependent | No | **Yes (Ollama)** |
-| Installable as package | No | No | **`pip install -e .`** |
-
+ 
 ---
-
+ 
 ## Contributing
 
 PRs welcome. The codebase is intentionally simple — no frameworks, no heavy deps.
