@@ -1,0 +1,9 @@
+# Demo wiki configuration
+# This is the demo wiki shipped with llm-wiki-universal.
+# Change provider/model to match your setup.
+
+provider: ollama
+model: qwen2.5:3b
+temperature: 0.2
+max_tokens: 4096
+timeout: 120

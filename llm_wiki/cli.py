@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """
-llm-wiki-universal CLI — Day 4 additions
+llm-wiki-universal CLI — Day 5 additions
 
-New commands:
-  wiki nli                 — standalone NLI contradiction scan (no full lint)
-  wiki nli --backend llm   — force LLM backend
-  wiki nli --backend cross_encoder — force cross-encoder backend
-
-Updated commands:
-  wiki lint                — now runs NLI pass automatically
-  wiki lint --skip-nli     — structural checks only (fast)
-  wiki lint --nli-backend cross_encoder  — force a specific backend
+New:
+  wiki ingest --watch              — watch raw/ and auto-ingest new files
+  wiki ingest --watch --interval N — set poll interval (default: 10s)
+  wiki export                      — render wiki to self-contained HTML
+  wiki export --open               — open in browser after export
 """
 
 from __future__ import annotations
@@ -39,12 +35,23 @@ def main() -> None:
     p_init.add_argument("--provider", default="ollama")
     p_init.add_argument("--model", default="")
 
-    # ingest
+    # ingest  ← updated with --watch
     p_ingest = sub.add_parser("ingest", help="Ingest sources into the wiki")
     p_ingest.add_argument("--source", default=None)
     p_ingest.add_argument("--url", default=None)
     p_ingest.add_argument("--max", type=int, default=None)
     p_ingest.add_argument("--chunk-size", type=int, default=6000)
+    p_ingest.add_argument(
+        "--watch",
+        action="store_true",
+        help="Watch raw/ for new files and auto-ingest (Ctrl+C to stop)",
+    )
+    p_ingest.add_argument(
+        "--interval",
+        type=int,
+        default=10,
+        help="Watch poll interval in seconds (default: 10)",
+    )
 
     # query
     p_query = sub.add_parser("query", help="Ask a question against the wiki")
@@ -58,33 +65,27 @@ def main() -> None:
     p_search.add_argument("--top", "-n", type=int, default=10)
     p_search.add_argument("--rerank", action="store_true")
 
-    # lint  ← updated
-    p_lint = sub.add_parser("lint", help="Health-check the wiki (includes NLI)")
-    p_lint.add_argument(
-        "--skip-nli",
-        action="store_true",
-        help="Skip NLI contradiction detection (structural checks only)",
-    )
-    p_lint.add_argument(
-        "--nli-backend",
-        default="auto",
-        choices=["auto", "llm", "cross_encoder"],
-        help="NLI backend to use (default: auto)",
-    )
+    # lint
+    p_lint = sub.add_parser("lint", help="Health-check including NLI")
+    p_lint.add_argument("--skip-nli", action="store_true")
+    p_lint.add_argument("--nli-backend", default="auto", choices=["auto", "llm", "cross_encoder"])
 
-    # nli  ← NEW
+    # nli
     p_nli = sub.add_parser("nli", help="Standalone NLI contradiction scan")
-    p_nli.add_argument(
-        "--backend",
-        default="auto",
-        choices=["auto", "llm", "cross_encoder"],
-        help="NLI backend (default: auto — uses cross_encoder if installed)",
+    p_nli.add_argument("--backend", default="auto", choices=["auto", "llm", "cross_encoder"])
+    p_nli.add_argument("--max-pairs", type=int, default=300)
+
+    # export  ← NEW
+    p_export = sub.add_parser("export", help="Export wiki to a self-contained HTML file")
+    p_export.add_argument(
+        "--open",
+        action="store_true",
+        help="Open the exported file in your browser",
     )
-    p_nli.add_argument(
-        "--max-pairs",
-        type=int,
-        default=300,
-        help="Max claim pairs to check (default: 300)",
+    p_export.add_argument(
+        "--output",
+        default=None,
+        help="Output path (default: outputs/wiki-export-YYYY-MM-DD.html)",
     )
 
     # status
@@ -110,6 +111,7 @@ def main() -> None:
         "search": cmd_search,
         "lint": cmd_lint,
         "nli": cmd_nli,
+        "export": cmd_export,
         "status": cmd_status,
         "providers": cmd_providers,
         "doctor": cmd_doctor,
@@ -157,7 +159,7 @@ def cmd_init(args) -> None:
         _ok("Created .gitignore")
 
     _ok(f"\nWiki initialised at: {root}")
-    print(f"\n  Next: wiki ingest --url https://...  or  drop files into raw/")
+    print(f"\n  Next: wiki ingest --url https://...  or  wiki ingest --watch")
 
 
 def cmd_ingest(args) -> None:
@@ -166,6 +168,21 @@ def cmd_ingest(args) -> None:
     from .operations.ingest import IngestOperation
 
     fs = WikiFS(Path(args.root).resolve())
+
+    # Watch mode
+    if getattr(args, "watch", False):
+        from .utils.watcher import WikiWatcher
+
+        interval = getattr(args, "interval", 10)
+        watcher = WikiWatcher(
+            provider,
+            fs,
+            interval=interval,
+            verbose=args.verbose,
+        )
+        watcher.run()
+        return
+
     op = IngestOperation(
         provider,
         fs,
@@ -248,10 +265,7 @@ def cmd_search(args) -> None:
     from .operations.search import SearchOperation
 
     fs = WikiFS(Path(args.root).resolve())
-    if getattr(args, "rerank", False):
-        provider = _get_provider(args)
-    else:
-        provider = _null_provider()
+    provider = _get_provider(args) if getattr(args, "rerank", False) else _null_provider()
 
     op = SearchOperation(provider, fs, verbose=args.verbose)
     resp = op.search(
@@ -279,7 +293,6 @@ def cmd_search(args) -> None:
 
 
 def cmd_lint(args) -> None:
-    """Run full lint including NLI contradiction detection."""
     provider = _get_provider(args)
     from .wiki_fs import WikiFS
     from .operations.lint import LintOperation
@@ -300,12 +313,10 @@ def cmd_lint(args) -> None:
 
     _ok(f"Lint complete — {result.issue_count} total issues")
 
-    # NLI results
     if not skip_nli:
         print(
-            f"\n  NLI scan ({result.nli_backend} backend): "
-            f"{result.nli_pages_checked} pages, "
-            f"{result.nli_pairs_checked} pairs checked"
+            f"\n  NLI ({result.nli_backend}): "
+            f"{result.nli_pages_checked} pages, {result.nli_pairs_checked} pairs"
         )
         if result.nli_contradictions:
             print(f"\n  Contradictions ({len(result.nli_contradictions)}):")
@@ -315,10 +326,7 @@ def cmd_lint(args) -> None:
             print("  Contradictions: none found ✓")
         if result.pages_downgraded:
             print(f"\n  Confidence downgraded: {len(result.pages_downgraded)} page(s)")
-            for p in result.pages_downgraded:
-                print(f"    • {p}")
 
-    # Structural results
     if result.orphan_pages:
         print(f"\n  Orphan pages ({len(result.orphan_pages)}):")
         for p in result.orphan_pages:
@@ -334,27 +342,22 @@ def cmd_lint(args) -> None:
 
 
 def cmd_nli(args) -> None:
-    """Standalone NLI contradiction scan — faster than full lint."""
     provider = _get_provider(args)
     from .wiki_fs import WikiFS
-    from ..llm_wiki.utils.nli import NLIEngine
+    from .utils.nli import NLIEngine
 
     fs = WikiFS(Path(args.root).resolve())
-    pages_paths = fs.list_wiki_pages()
+    pages = {
+        fs.relative_to_root(p): p.read_text(encoding="utf-8", errors="replace")
+        for p in fs.list_wiki_pages()
+    }
 
-    if not pages_paths:
+    if not pages:
         _err("No wiki pages found. Run `wiki ingest` first.")
         sys.exit(1)
 
-    # Load all pages
-    pages: dict[str, str] = {}
-    for p in pages_paths:
-        rel = fs.relative_to_root(p)
-        pages[rel] = p.read_text(encoding="utf-8", errors="replace")
-
     backend = getattr(args, "backend", "auto")
     max_pairs = getattr(args, "max_pairs", 300)
-
     print(f"\n  NLI scan: {len(pages)} pages, backend={backend}\n")
 
     try:
@@ -375,19 +378,44 @@ def cmd_nli(args) -> None:
     print(f"  Contradictions:     {result.contradiction_count}\n")
 
     if result.contradictions:
-        print("  Contradictions found:\n")
         for c in result.contradictions:
             print(c.format())
-
-        # Offer to downgrade confidence
-        affected = result.pages_with_contradictions()
-        print(f"  Affected pages: {len(affected)}")
-        for p in sorted(affected):
-            print(f"    • {p}")
-        print()
         _info("Run `wiki lint` to downgrade confidence and save a full report.")
     else:
         _ok("No contradictions detected.")
+
+
+def cmd_export(args) -> None:
+    """Export the wiki to a self-contained HTML file."""
+    from .wiki_fs import WikiFS
+    from .utils.exporter import WikiExporter
+
+    fs = WikiFS(Path(args.root).resolve())
+    pages = fs.list_wiki_pages()
+
+    if not pages:
+        _err("No wiki pages found. Run `wiki ingest` first.")
+        sys.exit(1)
+
+    _info(f"Exporting {len(pages)} pages ...")
+    exporter = WikiExporter(fs)
+
+    custom_output = getattr(args, "output", None)
+    if custom_output:
+        html = exporter.render()
+        out_path = Path(custom_output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(html, encoding="utf-8")
+    else:
+        out_path = exporter.save()
+
+    _ok(f"Exported to: {out_path}")
+
+    if getattr(args, "open", False):
+        import webbrowser
+
+        webbrowser.open(out_path.resolve().as_uri())
+        _info("Opened in browser.")
 
 
 def cmd_status(args) -> None:
@@ -430,8 +458,8 @@ def cmd_status(args) -> None:
 
     summary = tracker.summary()
     if summary["total_calls"] > 0:
-        print(f"{'─' * 44}")
         total_tok = summary["total_prompt_tokens"] + summary["total_completion_tokens"]
+        print(f"{'─' * 44}")
         print(f"  Tokens:      {total_tok:,} total")
         print(f"  Est. cost:   ${summary['total_cost_usd']:.4f} USD")
 
@@ -448,13 +476,13 @@ def cmd_status(args) -> None:
 def cmd_providers(args) -> None:
     from .providers.factory import list_providers
 
-    print("\nSupported providers:")
     descriptions = {
         "ollama": "Local models via Ollama — free, no API key (default)",
         "openai": "OpenAI GPT-4o / o1 — requires OPENAI_API_KEY",
         "anthropic": "Anthropic Claude — requires ANTHROPIC_API_KEY",
         "openai_compat": "Any OpenAI-compatible endpoint (LM Studio, vLLM, Groq…)",
     }
+    print("\nSupported providers:")
     for p in list_providers():
         print(f"  {p:<18} {descriptions.get(p, '')}")
     print()
@@ -505,7 +533,7 @@ def cmd_usage(args) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Streaming query (carried from Day 2/3)
+# Streaming query
 # ---------------------------------------------------------------------------
 
 
@@ -635,7 +663,7 @@ def _default_agents_md(topic: str) -> str:
         "## Structure\n"
         "- raw/       Immutable sources (.md .txt .pdf or fetched URLs)\n"
         "- wiki/      LLM-generated markdown pages\n"
-        "- outputs/   Lint reports, NLI reports\n\n"
+        "- outputs/   Lint, NLI, and export files\n\n"
         "## Page frontmatter\n"
         "---\ntitle: Page Title\ntype: concept | entity | source-summary\n"
         "created: YYYY-MM-DD\nupdated: YYYY-MM-DD\nconfidence: high | medium | low\n---\n\n"
@@ -643,15 +671,15 @@ def _default_agents_md(topic: str) -> str:
     )
 
 
-def _ok(msg: str) -> None:
+def _ok(msg):
     print(f"\033[32m✓\033[0m {msg}")
 
 
-def _err(msg: str) -> None:
+def _err(msg):
     print(f"\033[31m✗\033[0m {msg}", file=sys.stderr)
 
 
-def _info(msg: str) -> None:
+def _info(msg):
     print(f"\033[34mℹ\033[0m {msg}")
 
 
